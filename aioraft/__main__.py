@@ -1,5 +1,4 @@
 import argparse
-import json
 import asyncio
 import logging
 
@@ -7,6 +6,7 @@ from aioraft.node import init, close
 from aioraft import settings
 
 log = logging.getLogger('aioraft')
+
 
 def run(args):
     loop = asyncio.get_event_loop()

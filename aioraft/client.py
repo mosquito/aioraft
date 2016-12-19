@@ -1,40 +1,62 @@
 import asyncio
-import json
+import msgpack
+from async_timeout import timeout as Timeout
+from .types import Types, Command, Code
 
 
 class Connection:
-    def __init__(self, host, port, loop):
-        self.host = host
-        self.port = port
-        self.loop = loop
-        self.open = False
-        self._reader = None
-        self._writer = None
+    __slots__ = (
+        'host', 'port', 'loop', 'open', '_reader', '_writer',
+        '__reader_lock', '__connection_lock',
+    )
+
+    def __init__(self, host: str, port: int, loop: asyncio.AbstractEventLoop):
+        self.host = host                    # type: str
+        self.port = int(port)               # type: int
+        self.loop = loop                    # type: asyncio.AbstractEventLoop
+        self.open = False                   # type: bool
+        self._reader = None                 # type: asyncio.StreamReader
+        self._writer = None                 # type: asyncio.StreamWriter
+        self.__reader_lock = asyncio.Lock(loop=self.loop)
+        self.__connection_lock = asyncio.Lock(loop=self.loop)
 
     @asyncio.coroutine
     def connect(self):
-        if not self.open:
+        if self.open:
+            return
+
+        with (yield from self.__connection_lock):
             self._reader, self._writer = yield from asyncio.open_connection(
-                self.host, self.port, loop=self.loop)
+                self.host,
+                self.port,
+                loop=self.loop
+            )
+
             self.open = True
 
     @asyncio.coroutine
     def read(self, n=-1):
         yield from self.connect()
-        data = yield from self._reader.read(n)
-        return data
+
+        with (yield from self.__reader_lock):
+            data = yield from self._reader.read(n)
+            return data
 
     @asyncio.coroutine
     def readline(self):
         yield from self.connect()
-        data = yield from self._reader.readline()
-        return data
+
+        with (yield from self.__reader_lock):
+            data = yield from self._reader.readline()
+            return data
 
     @asyncio.coroutine
     def readexactly(self, n):
         yield from self.connect()
-        data = yield from self._reader.readexactly(n)
-        return data
+
+        with (yield from self.__reader_lock):
+            data = yield from self._reader.readexactly(n)
+            return data
 
     def write(self, data):
         return self._writer.write(data)
@@ -59,104 +81,67 @@ class Connection:
         yield from self._writer.drain()
 
 
-
 class Client:
-    def __init__(self, host='127.0.0.1', port='2437', loop=None, timeout=5):
-        self.loop = loop if loop else asyncio.get_event_loop()
-        self.remote_host = host
-        self.remote_port = port
-        self.conn = Connection(host, port, loop)
-        self.timeout = timeout
+    __slots__ = 'loop', 'remote_host', 'remote_port', 'connection', 'timeout'
+
+    def __init__(self, host: str='127.0.0.1', port: int=2437,
+                 loop: asyncio.AbstractEventLoop=None, timeout: int=5):
+
+        self.loop = loop if loop else asyncio.get_event_loop()  # type: asyncio.AbstractEventLoop
+        self.remote_host = host                                 # type: str
+        self.remote_port = int(port)                            # type: int
+        self.timeout = timeout                                  # type: int
+        self.connection = Connection(host, port, loop)          # type: Connection
 
     @asyncio.coroutine
+    def __get_response(self):
+        code = Code.unpack((yield from self.connection.readexactly(len(Code))))
+
+        length = Types.ulong.unpack((
+            yield from self.connection.readexactly(len(Types.ulong))
+        ))
+
+        data = msgpack.loads((yield from self.connection.readexactly(length)))
+        return code, data
+
+    @staticmethod
+    def __create_request(command: Command, request_data=None):
+        payload = msgpack.dumps(request_data)
+        length = len(payload)
+
+        return command.pack() + Types.ulong.pack(length) + payload
+
+    @asyncio.coroutine
+    def request(self, command: Command, payload: dict, timeout=None):
+        with Timeout(timeout or self.timeout, loop=self.loop):
+            yield from self.connection.connect()
+            self.connection.write(
+                self.__create_request(command, payload)
+            )
+            yield from self.connection.drain()
+            return (yield from self.__get_response())
+
     def map(self, timeout=None):
-        timeout = timeout if timeout is not None else self.timeout
-        data = yield from asyncio.wait_for(self._map(), timeout)
-        return data
+        return self.request(Command.MAP, timeout)
 
-    @asyncio.coroutine
-    def _map(self):
-        yield from self.conn.connect()
-        self.conn.write(b'map\n\n')
-        yield from self.conn.drain()
-        code = yield from self.conn.readline()
-        code = int(code)
-        data = yield from self.conn.readline()
-        return data
-
-    @asyncio.coroutine
     def set(self, key, value, timeout=None):
-        timeout = timeout if timeout is not None else self.timeout
-        data = yield from asyncio.wait_for(self._set(key, value), timeout)
-        return data
+        return self.request(Command.SET, {'value': value, 'key': key}, timeout=timeout)
 
-    @asyncio.coroutine
-    def _set(self, key, value):
-        yield from self.conn.connect()
-        self.conn.writelines([b'set\n', bytes(json.dumps(dict(value=value, key=key)), 'utf-8'), b'\n'])
-        yield from self.conn.drain()
-        code = yield from self.conn.readline()
-        code = int(code)
-        data = yield from self.conn.readline()
-        return data
-
-    @asyncio.coroutine
     def get(self, key, timeout=None):
-        timeout = timeout if timeout is not None else self.timeout
-        data = yield from asyncio.wait_for(self._get(key), timeout)
-        return data
-
-    @asyncio.coroutine
-    def _get(self, key):
-        yield from self.conn.connect()
-        self.conn.writelines([b'get\n',
-                bytes(json.dumps(dict(key=key)), 'utf-8'), b'\n'])
-        yield from self.conn.drain()
-        code = yield from self.conn.readline()
-        code = int(code)
-        data = yield from self.conn.readline()
-        return data
+        return self.request(Command.GET, {'key': key}, timeout=timeout)
 
 
 class NodeClient(Client):
+    __slots__ = 'node_host', 'node_port'
+
     def __init__(self, *args, **kwargs):
         node = kwargs.pop('node')
         self.node_host = node.host
         self.node_port = node.port
         super(NodeClient, self).__init__(*args, **kwargs)
 
-    @asyncio.coroutine
     def join(self, host, port, timeout=None):
-        timeout = timeout if timeout is not None else self.timeout
-        data = asyncio.wait_for(self._join(host, port), timeout)
-        return data
+        return self.request(Command.JOIN, dict(host=host, port=port), timeout=timeout)
 
-    @asyncio.coroutine
-    def _join(self, host, port):
-        yield from self.conn.connect()
-        self.conn.writelines([
-            b'join\n',
-            bytes(json.dumps(dict(host=host, port=port)),'utf-8'),
-            b'\n'
-        ])
-        yield from self.conn.drain()
-        code = yield from self.conn.readline()
-        code = int(code)
-        data = yield from self.conn.readline()
-        return data
-
-    @asyncio.coroutine
     def replicate(self, timeout=None, **kwargs):
-        timeout = timeout if timeout is not None else self.timeout
-        data = yield from asyncio.wait_for(self._replicate(kwargs), timeout)
-        return data
-
-    @asyncio.coroutine
-    def _replicate(self, kwargs):
-        yield from self.conn.connect()
-        self.conn.writelines([b'replicate\n', bytes(json.dumps(kwargs), 'utf-8'), b'\n'])
-        yield from self.conn.drain()
-        code = yield from self.conn.readline()
-        code = int(code)
-        data = yield from self.conn.readline()
-        return data
+        return self.request(Command.REPLICATE, kwargs, timeout=timeout)

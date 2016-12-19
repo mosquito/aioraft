@@ -1,4 +1,8 @@
+
+
 class Entry:
+    __slots__ = 'name', 'node', 'prev_value', 'index'
+
     def __init__(self, name, node=None):
         self.name = name
         self.node = node
@@ -7,12 +11,16 @@ class Entry:
 
 
 class FileEntry(Entry):
+    __slots__ = 'value',
+
     def __init__(self, name, value=None, node=None):
         super(FileEntry, self).__init__(name, node)
         self.value = value
 
 
 class DirEntry(dict, Entry):
+    __slots__ = ()
+
     def __init__(self, name, node=None):
         Entry.__init__(self, name, node=node)
 
@@ -61,6 +69,7 @@ class DirEntry(dict, Entry):
                 raise
         if not rest:
             return entry
+
         return entry.get_entry(rest, create=create)
 
 

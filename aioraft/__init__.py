@@ -1,9 +1,7 @@
 import imp
 import os
 import warnings
-import sys
 import aioraft._defaultsettings as _defaultsettings
-import logging
 from logging.config import dictConfig
 
 _CONFFILE = os.environ.get("AIORAFT_SETTINGS", "/etc/aioraft")
